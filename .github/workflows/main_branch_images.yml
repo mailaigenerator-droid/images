@@ -1,0 +1,171 @@
+name: Migrate Existing Images to WebP
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  migrate-images:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Sharp
+        run: npm install sharp
+
+      - name: Convert existing images
+        run: |
+          node <<'EOF'
+          const sharp = require("sharp");
+          const fs = require("fs");
+          const path = require("path");
+
+          const MAX_WIDTH = 600;
+          const MAX_SIZE = 200 * 1024;
+
+          async function optimizeImage(input) {
+            const ext = path.extname(input);
+            const output = input.slice(0, -ext.length) + ".webp";
+
+            const metadata = await sharp(input).metadata();
+
+            let width = Math.min(metadata.width, MAX_WIDTH);
+            let quality = 90;
+            let buffer;
+
+            // Try to maintain high quality first.
+            while (quality >= 60) {
+              buffer = await sharp(input)
+                .resize({
+                  width,
+                  withoutEnlargement: true
+                })
+                .webp({
+                  quality,
+                  effort: 6
+                })
+                .toBuffer();
+
+              if (buffer.length <= MAX_SIZE) {
+                break;
+              }
+
+              quality -= 5;
+            }
+
+            // If still larger than 200 KB,
+            // reduce dimensions while preserving aspect ratio.
+            while (buffer.length > MAX_SIZE && width > 300) {
+              width = Math.floor(width * 0.9);
+
+              buffer = await sharp(input)
+                .resize({
+                  width,
+                  withoutEnlargement: true
+                })
+                .webp({
+                  quality: Math.max(quality, 60),
+                  effort: 6
+                })
+                .toBuffer();
+            }
+
+            // Final fallback.
+            while (buffer.length > MAX_SIZE && quality > 40) {
+              quality -= 5;
+
+              buffer = await sharp(input)
+                .resize({
+                  width,
+                  withoutEnlargement: true
+                })
+                .webp({
+                  quality,
+                  effort: 6
+                })
+                .toBuffer();
+            }
+
+            fs.writeFileSync(output, buffer);
+
+            const sizeKB = (buffer.length / 1024).toFixed(1);
+
+            console.log(
+              `${input} -> ${output} | ` +
+              `${width}px | quality ${quality} | ${sizeKB} KB`
+            );
+
+            fs.unlinkSync(input);
+          }
+
+          function findImages(directory) {
+            let results = [];
+
+            for (const entry of fs.readdirSync(directory, {
+              withFileTypes: true
+            })) {
+              if (
+                entry.name === ".git" ||
+                entry.name === "node_modules"
+              ) {
+                continue;
+              }
+
+              const fullPath = path.join(directory, entry.name);
+
+              if (entry.isDirectory()) {
+                results = results.concat(findImages(fullPath));
+              } else if (
+                /\.(jpg|jpeg|png)$/i.test(entry.name)
+              ) {
+                results.push(fullPath);
+              }
+            }
+
+            return results;
+          }
+
+          async function main() {
+            const images = findImages(".");
+
+            console.log(`Found ${images.length} images.`);
+
+            for (const image of images) {
+              await optimizeImage(image);
+            }
+
+            console.log("Migration completed.");
+          }
+
+          main().catch(error => {
+            console.error(error);
+            process.exit(1);
+          });
+          EOF
+
+      - name: Commit migration
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo "No images needed migration."
+            exit 0
+          fi
+
+          git commit -m "chore: migrate existing images to WebP"
+          git push origin main
